@@ -108,3 +108,119 @@
 (define-public (transfer (certificate-id uint) (sender principal) (recipient principal))
   (err u1)) ;; Transfers not allowed - soulbound
 
+(define-constant err-certificate-revoked (err u107))
+(define-constant err-already-revoked (err u108))
+
+(define-map certificate-revocations uint 
+  {
+    revoked: bool,
+    revocation-date: uint,
+    reason: (string-ascii 100),
+    revoked-by: principal
+  }
+)
+
+(define-public (revoke-certificate (certificate-id uint) (reason (string-ascii 100)))
+  (let 
+    (
+      (certificate-data (map-get? certificates certificate-id))
+      (revocation-data (map-get? certificate-revocations certificate-id))
+    )
+    (asserts! (is-some certificate-data) err-certificate-not-found)
+    (asserts! (is-eq tx-sender (get institution (unwrap-panic certificate-data))) err-not-authorized)
+    (asserts! (or (is-none revocation-data) (not (get revoked (unwrap-panic revocation-data)))) err-already-revoked)
+    (ok (map-set certificate-revocations certificate-id
+      {
+        revoked: true,
+        revocation-date: stacks-block-height,
+        reason: reason,
+        revoked-by: tx-sender
+      }))))
+
+(define-read-only (is-certificate-revoked (certificate-id uint))
+  (match (map-get? certificate-revocations certificate-id)
+    revocation-data (ok (get revoked revocation-data))
+    (ok false)))
+
+(define-read-only (get-revocation-details (certificate-id uint))
+  (match (map-get? certificate-revocations certificate-id)
+    revocation-data (ok revocation-data)
+    err-certificate-not-found))
+
+(define-public (verify-certificate-with-revocation (certificate-id uint) (expected-recipient principal))
+  (let 
+    (
+      (certificate-data (map-get? certificates certificate-id))
+      (revocation-data (map-get? certificate-revocations certificate-id))
+    )
+    (asserts! (is-some certificate-data) err-certificate-not-found)
+    (asserts! (or (is-none revocation-data) (not (get revoked (unwrap-panic revocation-data)))) err-certificate-revoked)
+    (ok (is-eq (get recipient (unwrap-panic certificate-data)) expected-recipient))))
+
+(define-constant err-invalid-category (err u109))
+
+(define-map certificate-categories uint (string-ascii 20))
+
+(define-map recipient-certificates principal (list 100 uint))
+
+(define-map category-certificates (string-ascii 20) (list 1000 uint))
+
+(define-public (issue-certificate-with-category
+    (recipient principal)
+    (title (string-ascii 100))
+    (description (string-ascii 200))
+    (grade (optional (string-ascii 2)))
+    (metadata-url (string-ascii 200))
+    (category (string-ascii 20)))
+  (let 
+    (
+      (institution-data (map-get? institutions tx-sender))
+      (certificate-id (+ (var-get certificate-counter) u1))
+      (recipient-certs (default-to (list) (map-get? recipient-certificates recipient)))
+      (category-certs (default-to (list) (map-get? category-certificates category)))
+    )
+    (asserts! (is-some institution-data) err-invalid-institution)
+    (asserts! (get verified (unwrap-panic institution-data)) err-not-authorized)
+    (try! (nft-mint? soulbound-certificate certificate-id recipient))
+    (map-set certificates certificate-id
+      {
+        institution: tx-sender,
+        recipient: recipient,
+        title: title,
+        description: description,
+        issue-date: stacks-block-height,
+        grade: grade,
+        metadata-url: metadata-url
+      })
+    (map-set certificate-categories certificate-id category)
+    (map-set recipient-certificates recipient (unwrap-panic (as-max-len? (append recipient-certs certificate-id) u100)))
+    (map-set category-certificates category (unwrap-panic (as-max-len? (append category-certs certificate-id) u1000)))
+    (var-set certificate-counter certificate-id)
+    (ok certificate-id)))
+
+(define-read-only (get-certificate-category (certificate-id uint))
+  (match (map-get? certificate-categories certificate-id)
+    category (ok category)
+    err-certificate-not-found))
+
+(define-read-only (get-certificates-by-recipient (recipient principal))
+  (match (map-get? recipient-certificates recipient)
+    cert-list (ok cert-list)
+    (ok (list))))
+
+(define-read-only (get-certificates-by-category (category (string-ascii 20)))
+  (match (map-get? category-certificates category)
+    cert-list (ok cert-list)
+    (ok (list))))
+
+(define-read-only (get-recipient-certificates-by-category (recipient principal) (category (string-ascii 20)))
+  (let 
+    (
+      (recipient-certs (default-to (list) (map-get? recipient-certificates recipient)))
+    )
+    (ok (filter check-certificate-category recipient-certs))))
+
+(define-private (check-certificate-category (certificate-id uint))
+  (match (map-get? certificate-categories certificate-id)
+    cert-category true
+    false))
