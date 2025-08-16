@@ -224,3 +224,59 @@
   (match (map-get? certificate-categories certificate-id)
     cert-category true
     false))
+
+(define-constant err-batch-limit-exceeded (err u110))
+
+(define-public (issue-certificates-batch
+    (batch-data (list 50 {
+      recipient: principal,
+      title: (string-ascii 100),
+      description: (string-ascii 200),
+      grade: (optional (string-ascii 2)),
+      metadata-url: (string-ascii 200),
+      category: (string-ascii 20)
+    })))
+  (let 
+    (
+      (institution-data (map-get? institutions tx-sender))
+    )
+    (asserts! (is-some institution-data) err-invalid-institution)
+    (asserts! (get verified (unwrap-panic institution-data)) err-not-authorized)
+    (asserts! (<= (len batch-data) u50) err-batch-limit-exceeded)
+    (ok (map process-certificate-batch batch-data))))
+
+(define-private (process-certificate-batch (cert-data {
+      recipient: principal,
+      title: (string-ascii 100),
+      description: (string-ascii 200),
+      grade: (optional (string-ascii 2)),
+      metadata-url: (string-ascii 200),
+      category: (string-ascii 20)
+    }))
+  (let 
+    (
+      (certificate-id (+ (var-get certificate-counter) u1))
+      (recipient (get recipient cert-data))
+      (recipient-certs (default-to (list) (map-get? recipient-certificates recipient)))
+      (category (get category cert-data))
+      (category-certs (default-to (list) (map-get? category-certificates category)))
+    )
+    (unwrap-panic (nft-mint? soulbound-certificate certificate-id recipient))
+    (map-set certificates certificate-id
+      {
+        institution: tx-sender,
+        recipient: recipient,
+        title: (get title cert-data),
+        description: (get description cert-data),
+        issue-date: stacks-block-height,
+        grade: (get grade cert-data),
+        metadata-url: (get metadata-url cert-data)
+      })
+    (map-set certificate-categories certificate-id category)
+    (map-set recipient-certificates recipient (unwrap-panic (as-max-len? (append recipient-certs certificate-id) u100)))
+    (map-set category-certificates category (unwrap-panic (as-max-len? (append category-certs certificate-id) u1000)))
+    (var-set certificate-counter certificate-id)
+    certificate-id))
+
+(define-read-only (get-batch-processing-limit)
+  u50)
