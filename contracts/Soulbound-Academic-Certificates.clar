@@ -165,6 +165,58 @@
 
 (define-map category-certificates (string-ascii 20) (list 1000 uint))
 
+(define-map certificate-expiry uint 
+  {
+    expiry-date: (optional uint),
+    renewable: bool,
+    renewal-period: uint,
+    max-renewals: uint,
+    renewals-count: uint
+  })
+
+(define-map certificate-renewals uint (list 10 uint))
+
+(define-public (issue-certificate-with-expiry
+    (recipient principal)
+    (title (string-ascii 100))
+    (description (string-ascii 200))
+    (grade (optional (string-ascii 2)))
+    (metadata-url (string-ascii 200))
+    (expiry-date (optional uint))
+    (renewable bool)
+    (renewal-period uint)
+    (max-renewals uint))
+  (let 
+    (
+      (institution-data (map-get? institutions tx-sender))
+      (certificate-id (+ (var-get certificate-counter) u1))
+    )
+    (asserts! (is-some institution-data) err-invalid-institution)
+    (asserts! (get verified (unwrap-panic institution-data)) err-not-authorized)
+    (asserts! (or (is-none expiry-date) (> (unwrap-panic expiry-date) stacks-block-height)) err-invalid-expiry-date)
+    (try! (nft-mint? soulbound-certificate certificate-id recipient))
+    (map-set certificates certificate-id
+      {
+        institution: tx-sender,
+        recipient: recipient,
+        title: title,
+        description: description,
+        issue-date: stacks-block-height,
+        grade: grade,
+        metadata-url: metadata-url
+      })
+    (map-set certificate-expiry certificate-id
+      {
+        expiry-date: expiry-date,
+        renewable: renewable,
+        renewal-period: renewal-period,
+        max-renewals: max-renewals,
+        renewals-count: u0
+      })
+    (map-set certificate-renewals certificate-id (list))
+    (var-set certificate-counter certificate-id)
+    (ok certificate-id)))
+
 (define-public (issue-certificate-with-category
     (recipient principal)
     (title (string-ascii 100))
@@ -226,6 +278,9 @@
     false))
 
 (define-constant err-batch-limit-exceeded (err u110))
+(define-constant err-certificate-expired (err u111))
+(define-constant err-invalid-expiry-date (err u112))
+(define-constant err-not-renewable (err u113))
 
 (define-public (issue-certificates-batch
     (batch-data (list 50 {
@@ -277,6 +332,65 @@
     (map-set category-certificates category (unwrap-panic (as-max-len? (append category-certs certificate-id) u1000)))
     (var-set certificate-counter certificate-id)
     certificate-id))
+
+(define-public (renew-certificate (certificate-id uint))
+  (let 
+    (
+      (certificate-data (map-get? certificates certificate-id))
+      (expiry-data (map-get? certificate-expiry certificate-id))
+      (renewal-history (default-to (list) (map-get? certificate-renewals certificate-id)))
+    )
+    (asserts! (is-some certificate-data) err-certificate-not-found)
+    (asserts! (is-some expiry-data) err-certificate-not-found)
+    (asserts! (is-eq tx-sender (get institution (unwrap-panic certificate-data))) err-not-authorized)
+    (let ((expiry-info (unwrap-panic expiry-data)))
+      (asserts! (get renewable expiry-info) err-not-renewable)
+      (asserts! (< (get renewals-count expiry-info) (get max-renewals expiry-info)) err-not-renewable)
+      (let ((new-expiry-date (+ stacks-block-height (get renewal-period expiry-info))))
+        (map-set certificate-expiry certificate-id
+          (merge expiry-info
+            {
+              expiry-date: (some new-expiry-date),
+              renewals-count: (+ (get renewals-count expiry-info) u1)
+            }))
+        (map-set certificate-renewals certificate-id 
+          (unwrap-panic (as-max-len? (append renewal-history stacks-block-height) u10)))
+        (ok new-expiry-date)))))
+
+(define-read-only (is-certificate-expired (certificate-id uint))
+  (match (map-get? certificate-expiry certificate-id)
+    expiry-data 
+      (match (get expiry-date expiry-data)
+        expiry-block (ok (>= stacks-block-height expiry-block))
+        (ok false))
+    (ok false)))
+
+(define-read-only (get-certificate-expiry-info (certificate-id uint))
+  (match (map-get? certificate-expiry certificate-id)
+    expiry-data (ok expiry-data)
+    err-certificate-not-found))
+
+(define-read-only (get-certificate-renewal-history (certificate-id uint))
+  (match (map-get? certificate-renewals certificate-id)
+    renewal-list (ok renewal-list)
+    (ok (list))))
+
+(define-read-only (verify-certificate-with-expiry (certificate-id uint) (expected-recipient principal))
+  (let 
+    (
+      (certificate-data (map-get? certificates certificate-id))
+      (revocation-data (map-get? certificate-revocations certificate-id))
+      (expiry-data (map-get? certificate-expiry certificate-id))
+    )
+    (asserts! (is-some certificate-data) err-certificate-not-found)
+    (asserts! (or (is-none revocation-data) (not (get revoked (unwrap-panic revocation-data)))) err-certificate-revoked)
+    (match expiry-data
+      expiry-info 
+        (match (get expiry-date expiry-info)
+          expiry-block (asserts! (< stacks-block-height expiry-block) err-certificate-expired)
+          true)
+      true)
+    (ok (is-eq (get recipient (unwrap-panic certificate-data)) expected-recipient))))
 
 (define-read-only (get-batch-processing-limit)
   u50)
