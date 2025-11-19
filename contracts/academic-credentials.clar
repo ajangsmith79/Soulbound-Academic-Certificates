@@ -26,6 +26,10 @@
 (define-constant CERT-REVOKED u2)
 (define-constant CERT-SUSPENDED u3)
 
+;; Error for suspension/expiration
+(define-constant ERR-CREDENTIAL-EXPIRED (err u111))
+(define-constant ERR-CREDENTIAL-SUSPENDED (err u112))
+
 ;; Achievement types for additional tracking
 (define-constant ACHIEVEMENT-HONOR-ROLL u1)
 (define-constant ACHIEVEMENT-DEAN-LIST u2)
@@ -45,6 +49,16 @@
 (define-data-var next-institution-id uint u1)
 (define-data-var next-achievement-id uint u1)
 (define-data-var next-verification-log-id uint u1)
+
+;; Suspension tracking map
+(define-map certificate-suspensions
+  uint
+  {
+    suspended-date: uint,
+    expiration-date: uint,
+    reason: (string-ascii 200)
+  }
+)
 
 ;; Institution registry map
 (define-map institutions
@@ -378,6 +392,61 @@
   )
 )
 
+(define-public (suspend-certificate (certificate-id uint) (expiration-date uint) (reason (string-ascii 200)))
+  (let
+    (
+      (certificate-data (unwrap! (map-get? certificates certificate-id) ERR-CERTIFICATE-NOT-FOUND))
+      (institution-data (unwrap! (map-get? institutions (get institution-id certificate-data)) ERR-INVALID-INSTITUTION))
+      (current-status (get status certificate-data))
+    )
+    (if (and
+         (is-eq tx-sender (get admin institution-data))
+         (is-eq current-status CERT-ACTIVE)
+       )
+      (begin
+        (map-set certificates
+          certificate-id
+          (merge certificate-data { status: CERT-SUSPENDED })
+        )
+        (map-set certificate-suspensions
+          certificate-id
+          {
+            suspended-date: burn-block-height,
+            expiration-date: expiration-date,
+            reason: reason
+          }
+        )
+        (ok true)
+      )
+      ERR-NOT-AUTHORIZED
+    )
+  )
+)
+
+(define-public (unsuspend-certificate (certificate-id uint))
+  (let
+    (
+      (certificate-data (unwrap! (map-get? certificates certificate-id) ERR-CERTIFICATE-NOT-FOUND))
+      (institution-data (unwrap! (map-get? institutions (get institution-id certificate-data)) ERR-INVALID-INSTITUTION))
+      (current-status (get status certificate-data))
+    )
+    (if (and
+         (is-eq tx-sender (get admin institution-data))
+         (is-eq current-status CERT-SUSPENDED)
+       )
+      (begin
+        (map-set certificates
+          certificate-id
+          (merge certificate-data { status: CERT-ACTIVE })
+        )
+        (map-delete certificate-suspensions certificate-id)
+        (ok true)
+      )
+      ERR-NOT-AUTHORIZED
+    )
+  )
+)
+
 ;; Read-only functions
 
 ;; Get certificate details
@@ -519,6 +588,57 @@
       total-certificates: total-certs,
       certificates-with-verifications: u0 ;; Would need complex implementation
     })
+  )
+)
+
+(define-read-only (get-suspension-details (certificate-id uint))
+  (map-get? certificate-suspensions certificate-id)
+)
+
+(define-read-only (check-credential-validity (certificate-id uint))
+  (match (map-get? certificates certificate-id)
+    certificate-data
+    (let
+      (
+        (status (get status certificate-data))
+        (suspension-info (map-get? certificate-suspensions certificate-id))
+      )
+      (if (is-eq status CERT-REVOKED)
+        (ok {
+          is-valid: false,
+          reason: "Certificate revoked"
+        })
+        (if (is-eq status CERT-SUSPENDED)
+          (match suspension-info
+            susp-data
+            (let
+              (
+                (expiration (get expiration-date susp-data))
+              )
+              (if (> burn-block-height expiration)
+                (ok {
+                  is-valid: false,
+                  reason: "Suspension expired"
+                })
+                (ok {
+                  is-valid: false,
+                  reason: "Credential suspended"
+                })
+              )
+            )
+            (ok {
+              is-valid: false,
+              reason: "Suspension data missing"
+            })
+          )
+          (ok {
+            is-valid: true,
+            reason: "Credential active"
+          })
+        )
+      )
+    )
+    ERR-CERTIFICATE-NOT-FOUND
   )
 )
 
